@@ -1,3 +1,5 @@
+![Banner](banner.png)
+
 # misconfig-ConfigValueEntropyChecker
 Calculates the entropy of configuration values to detect potentially weak or default secrets/keys using the 'entropy' library. It flags values with low entropy as potentially problematic. - Focused on Check for misconfigurations in configuration files or infrastructure definitions
 
