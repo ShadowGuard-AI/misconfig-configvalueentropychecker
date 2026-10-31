@@ -42,58 +42,91 @@ def calculate_entropy(data):
 
     return entropy
 
+MIN_MEASURED_LENGTH = 8
+
+
+class EmptyInputError(ValueError):
+    """Raised when the input file holds nothing to measure."""
+
+
+class UnsupportedFileError(ValueError):
+    """Raised when the input file type is not supported."""
+
+
 def check_file_entropy(file_path, threshold=3.0):
     """
-    Checks the entropy of string values in a configuration file (JSON or YAML).
+    Checks the entropy of string and numeric values in a configuration
+    file (JSON or YAML).
+
+    Values are never returned, logged, or printed: a finding carries
+    only the key path and the entropy score, so a flagged value, which
+    may be a real secret, is never echoed in clear.
 
     Args:
         file_path (str): The path to the configuration file.
-        threshold (float): The entropy threshold to flag values.
+        threshold (float): The per character entropy threshold.
 
     Returns:
-        list: A list of tuples, where each tuple contains (key, value, entropy) for values below the threshold.
-              Returns an empty list if no low-entropy values are found or if the file type is not supported.
+        tuple: (list of (path, entropy) tuples for values below the
+        threshold, count of values measured)
+
+    Raises:
+        EmptyInputError: If the file is empty or holds no data.
+        UnsupportedFileError: If the file type is not JSON or YAML.
+        json.JSONDecodeError, yaml.YAMLError: If the file is malformed.
     """
     low_entropy_values = []
+    measured_count = [0]
 
-    try:
-        with open(file_path, 'r') as file:
-            if file_path.endswith('.json'):
-                data = json.load(file)
-            elif file_path.endswith('.yaml') or file_path.endswith('.yml'):
-                data = yaml.safe_load(file)
-            else:
-                logging.error(f"Unsupported file type: {file_path}. Supported types are JSON and YAML.")
-                return []  # Indicate unsupported file type
+    with open(file_path, 'r') as file:
+        text = file.read()
 
-        # Recursively traverse the data structure to find string values
-        def traverse(obj, path=""):
-            if isinstance(obj, dict):
-                for key, value in obj.items():
-                    new_path = f"{path}.{key}" if path else key
-                    traverse(value, new_path)
-            elif isinstance(obj, list):
-                for i, value in enumerate(obj):
-                    new_path = f"{path}[{i}]"
-                    traverse(value, new_path)
-            elif isinstance(obj, str):
-                entropy = calculate_entropy(obj)
-                if entropy < threshold:
-                    low_entropy_values.append((path, obj, entropy))
-                    logging.warning(f"Low entropy value found at {path}: Entropy = {entropy}, Value = {obj[:50]}...") # Log first 50 characters
+    if not text.strip():
+        raise EmptyInputError(f"File is empty: {file_path}")
 
-        traverse(data)
+    if file_path.endswith('.json'):
+        data = json.loads(text)
+    elif file_path.endswith('.yaml') or file_path.endswith('.yml'):
+        data = yaml.safe_load(text)
+    else:
+        raise UnsupportedFileError(
+            f"Unsupported file type: {file_path}. Supported types are JSON and YAML."
+        )
 
-    except FileNotFoundError:
-        logging.error(f"File not found: {file_path}")
-    except json.JSONDecodeError:
-        logging.error(f"Failed to decode JSON file: {file_path}")
-    except yaml.YAMLError as e:
-        logging.error(f"Failed to decode YAML file: {file_path}: {e}")
-    except Exception as e:
-        logging.error(f"An unexpected error occurred: {e}")
+    if data is None:
+        raise EmptyInputError(f"File holds no data to measure: {file_path}")
 
-    return low_entropy_values
+    # Recursively traverse the data structure. String values and
+    # numeric values (measured through their decimal text) are
+    # measured; booleans are not. A value shorter than
+    # MIN_MEASURED_LENGTH characters is counted as measured but never
+    # flagged, because per character entropy is capped by the number
+    # of distinct characters a short value can hold, so the score
+    # cannot separate a short random value from a short weak one.
+    def traverse(obj, path=""):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                new_path = f"{path}.{key}" if path else key
+                traverse(value, new_path)
+        elif isinstance(obj, list):
+            for i, value in enumerate(obj):
+                new_path = f"{path}[{i}]"
+                traverse(value, new_path)
+        elif isinstance(obj, bool):
+            return
+        elif isinstance(obj, (str, int, float)):
+            text_value = obj if isinstance(obj, str) else str(obj)
+            measured_count[0] += 1
+            if len(text_value) < MIN_MEASURED_LENGTH:
+                return
+            entropy = calculate_entropy(text_value)
+            if entropy < threshold:
+                low_entropy_values.append((path, entropy))
+                logging.warning(f"Low entropy value found at {path}: Entropy = {entropy}, Value = ***masked***")
+
+    traverse(data)
+
+    return low_entropy_values, measured_count[0]
 
 def setup_argparse():
     """
@@ -137,14 +170,36 @@ def main():
         logging.error(f"Error: File '{file_path}' is not readable.")
         sys.exit(1)
 
-    low_entropy_values = check_file_entropy(file_path, args.threshold)
+    try:
+        low_entropy_values, measured_count = check_file_entropy(file_path, args.threshold)
+    except EmptyInputError as e:
+        logging.error(str(e))
+        print(f"Empty input: no values were measured in {file_path}.")
+        sys.exit(1)
+    except UnsupportedFileError as e:
+        logging.error(str(e))
+        print(f"Unsupported file type: {file_path}. Supported types are JSON and YAML.")
+        sys.exit(1)
+    except json.JSONDecodeError:
+        logging.error(f"Failed to decode JSON file: {file_path}")
+        print(f"Could not parse {file_path} as JSON. No values were measured.")
+        sys.exit(1)
+    except yaml.YAMLError as e:
+        logging.error(f"Failed to decode YAML file: {file_path}: {e}")
+        print(f"Could not parse {file_path} as YAML. No values were measured.")
+        sys.exit(1)
+
+    if measured_count == 0:
+        print(f"No measurable string or numeric values were found in {file_path}. Nothing was checked.")
+        sys.exit(1)
 
     if low_entropy_values:
         print("Low entropy values found:")
-        for path, value, entropy in low_entropy_values:
+        for path, entropy in low_entropy_values:
             print(f"  Path: {path}")
-            print(f"  Value: {value[:50]}...") # Print first 50 characters of the value
+            print(f"  Value: ***masked***")
             print(f"  Entropy: {entropy:.4f}\n")
+        sys.exit(1)
     else:
         print("No low entropy values found.")
 
