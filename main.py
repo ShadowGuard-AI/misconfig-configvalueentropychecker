@@ -84,6 +84,10 @@ def check_file_entropy(file_path, threshold=3.0):
     if not text.strip():
         raise EmptyInputError(f"File is empty: {file_path}")
 
+    # The suffix test is case sensitive, so a file named .JSON is
+    # refused as unsupported while the identical contents under
+    # .json are measured. The file was already read in full
+    # above before this decision is made.
     if file_path.endswith('.json'):
         data = json.loads(text)
     elif file_path.endswith('.yaml') or file_path.endswith('.yml'):
@@ -110,16 +114,33 @@ def check_file_entropy(file_path, threshold=3.0):
                 traverse(value, new_path)
         elif isinstance(obj, list):
             for i, value in enumerate(obj):
+                # A value at the top level of a list, or a config that is one
+                # bare string, is reported with an empty or bracket only
+                # path. The finding still carries no value, so a reader
+                # chasing that entry has to count entries in the file by
+                # hand to find the value I flagged.
                 new_path = f"{path}[{i}]"
                 traverse(value, new_path)
         elif isinstance(obj, bool):
             return
         elif isinstance(obj, (str, int, float)):
+            # Numbers are measured through their printed form, so the
+            # score describes the decimal text, not the quantity. A
+            # timestamp and a small count can share a score, and a YAML
+            # date, which parses to a datetime object rather than a
+            # string or a number, is not measured at all: it falls
+            # through every branch of the walk without being counted.
             text_value = obj if isinstance(obj, str) else str(obj)
             measured_count[0] += 1
             if len(text_value) < MIN_MEASURED_LENGTH:
                 return
             entropy = calculate_entropy(text_value)
+            # Every value in the file is judged, not just values under
+            # sensitive names. A hostname, an environment label like
+            # production, or a repeated digit port number all have low
+            # per character entropy, and all are reported as if they
+            # were weak secrets. The reader has to supply the part I
+            # cannot: knowing which paths were ever meant to be secret.
             if entropy < threshold:
                 low_entropy_values.append((path, entropy))
                 logging.warning(f"Low entropy value found at {path}: Entropy = {entropy}, Value = ***masked***")
@@ -139,6 +160,11 @@ def setup_argparse():
                                      formatter_class=argparse.RawTextHelpFormatter)
 
     parser.add_argument("file_path", help="Path to the configuration file (JSON or YAML).")
+    # Nothing bounds this value. A threshold below zero flags
+    # nothing and reports the file clean, a very high one flags
+    # every measured value, and NaN, which argparse accepts as a
+    # float, makes every comparison false and also reports the
+    # file clean.
     parser.add_argument("-t", "--threshold", type=float, default=3.0,
                         help="Entropy threshold to flag values (default: 3.0).  Values below this threshold will be flagged.\n"
                              "Lower values will result in more sensitive reporting, potentially leading to false positives.\n"
